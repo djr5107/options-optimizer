@@ -195,6 +195,6 @@ if st.button("Scan Chains"):
                 fig.add_trace(go.Scatter(x=x, y=payoff, mode='lines', name='Payoff'))
                 fig.add_vline(x=S, line_dash="dash", line_color="green")
                 fig.update_layout(title="Payoff at Expiration", xaxis_title="Stock Price", yaxis_title="P&L")
-                st.plotly_chart(fig(fig, use_container_width=True))
+                st.plotly_chart(fig(fig, use_container_width=True)
         else:
             st.error("No setups found. Try lowering POP, increasing DTE, or using high-IV tickers (NVDA, TSLA).")
