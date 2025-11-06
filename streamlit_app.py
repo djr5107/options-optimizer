@@ -110,7 +110,6 @@ if st.button("Scan Chains"):
                     short_call, short_put = short_call.iloc[0], short_put.iloc[0]
 
                 credit = short_call.bid + short_put.bid
-                # Approximate POP for strangle
                 pop = norm.cdf((Kp - credit - S)/(S*iv*np.sqrt(T))) + norm.cdf(-(Kc + credit - S)/(S*iv*np.sqrt(T)))
                 add_trade({
                     "Exp": exp, "DTE": dte, "Strategy": strategy,
@@ -192,11 +191,11 @@ if st.button("Scan Chains"):
             if top.get("Valuation") and "Expensive" in top.get("Valuation",""):
                 st.balloons()
 
-            # ----- Payoff Chart (works for any strategy) -----
+            # ----- Payoff Chart -----
             fig = go.Figure()
             x = np.linspace(S*0.7, S*1.3, 300)
-            # Generic payoff – credit received, loss beyond breakevens
             strikes_str = top['Strikes']
+
             if "Iron Condor" in top['Strategy']:
                 parts = strikes_str.replace(" ","").split("-")
                 low = float(parts[0].split("/")[0][:-1])
@@ -205,9 +204,7 @@ if st.button("Scan Chains"):
                          np.where(x >= high, top['Credit'],
                          top['Credit'] - np.maximum(0, low - x) - np.maximum(0, x - high)))
             else:
-                # Simple credit strategy approximation
                 payoff = np.full_like(x, top['Credit'])
-                # subtract loss beyond wings (rough)
                 payoff = np.where(x < S*0.9, top['Credit'] - (S*0.9 - x)*0.5, payoff)
                 payoff = np.where(x > S*1.1, top['Credit'] - (x - S*1.1)*0.5, payoff)
 
