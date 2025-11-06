@@ -1,154 +1,200 @@
+# streamlit_app.py
 import streamlit as st
 import yfinance as yf
 import numpy as np
 import pandas as pd
 from scipy.stats import norm
 from datetime import datetime
+import plotly.graph_objects as go
 
-# Black-Scholes functions
+st.set_page_config(page_title="Premium Seller Pro", layout="wide")
+st.title("Premium Seller Pro – High-Probability Options Strategies")
+
+st.warning("NOT FINANCIAL ADVICE. Options carry unlimited risk. Paper trade first.")
+
+# ------------------- Helpers -------------------
 def bs_call(S, K, T, r, sigma, q=0):
-    if T <= 0 or sigma <= 0:
-        return max(S - K, 0)
-    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    return S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    if T <= 0 or sigma <= 0: return max(S - K * np.exp(-r*T), 0)
+    d1 = (np.log(S/K) + (r - q + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    return S*np.exp(-q*T)*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
 
 def bs_put(S, K, T, r, sigma, q=0):
-    if T <= 0 or sigma <= 0:
-        return max(K - S, 0)
-    d1 = (np.log(S / K) + (r - q + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    return K * np.exp(-r * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
+    if T <= 0 or sigma <= 0: return max(K*np.exp(-r*T) - S, 0)
+    d1 = (np.log(S/K) + (r - q + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    return K*np.exp(-r*T)*norm.cdf(-d2) - S*np.exp(-q*T)*norm.cdf(-d1)
 
-def calc_d2(S, K, T, r, sigma, q=0):
-    if T <= 0 or sigma <= 0:
-        return np.inf if S > K else -np.inf
-    return (np.log(S / K) + (r - q - 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+def option_delta(S, K, T, r, sigma, q=0, type_="call"):
+    if T <= 0 or sigma <= 0: return 1 if (type_=="call" and S>K) else -1 if (type_=="put" and K>S) else 0
+    d1 = (np.log(S/K) + (r - q + 0.5*sigma**2)*T) / (sigma*np.sqrt(T))
+    return np.exp(-q*T) * norm.cdf(d1) if type_=="call" else -np.exp(-q*T) * norm.cdf(-d1)
 
-# Streamlit app
-st.title("High-Probability Options Seller Tool (Short Strangle/Straddle)")
-st.warning("WARNING: Options trading is risky. No guarantees. Use paper trading. Naked shorts have unlimited risk.")
+def get_atm_iv(calls, puts, S):
+    # Closest strike to spot
+    all_strikes = pd.concat([calls['strike'], puts['strike']]).unique()
+    atm = min(all_strikes, key=lambda x: abs(x - S))
+    row = calls[calls.strike == atm]
+    if row.empty: row = puts[puts.strike == atm]
+    return row.iloc[0].impliedVolatility if not row.empty else 0.3
 
-ticker_sym = st.text_input("Stock Ticker", "AAPL").upper()
-strategy = st.selectbox("Strategy", ["Short Strangle (flexible strikes)", "Short Straddle (same strike only)"])
-min_pop_pct = st.slider("Minimum POP (%)", 70, 99, 95)
-max_dte = st.slider("Max Days to Expiration", 7, 180, 60)
+# ------------------- Sidebar Inputs -------------------
+with st.sidebar:
+    st.header("Inputs")
+    ticker_sym = st.text_input("Ticker", "AAPL").upper()
+    strategy = st.selectbox("Strategy", [
+        "Short Strangle", "Short Straddle", "Iron Condor",
+        "Bull Put Spread", "Bear Call Spread", "Jade Lizard"
+    ])
+    target_pop = st.slider("Min POP (%)", 70, 98, 90)
+    max_dte = st.slider("Max DTE", 7, 120, 45)
+    min_credit = st.number_input("Min Credit ($)", 0.10, 10.0, 0.50)
+    delta_target = st.slider("Short Delta (abs)", 0.05, 0.30, 0.16)
+    rr_min = st.slider("Min Reward:Risk", 0.1, 2.0, 0.3)
 
-if st.button("Run Analysis"):
-    with st.spinner("Fetching data & scanning chains..."):
+# ------------------- Main Logic -------------------
+if st.button("Scan Chains"):
+    with st.spinner("Fetching live data..."):
         ticker = yf.Ticker(ticker_sym)
         try:
             S = ticker.fast_info["lastPrice"]
         except:
-            st.error("Invalid ticker or no data.")
+            st.error("Invalid ticker.")
             st.stop()
 
-        # Risk-free rate (^TNX = 10yr Treasury)
+        # Rates
         try:
             r = yf.Ticker("^TNX").fast_info["lastPrice"] / 100
         except:
             r = 0.05
-        q = ticker.info.get("dividendYield", 0) or 0
+        q = ticker.info.get("dividendYield") or 0
 
-        # Historical Volatility (2y annualized)
+        # HV (2y)
         hist = ticker.history(period="2y")
-        if len(hist) < 100:
-            st.error("Not enough history for HV.")
+        if len(hist) < 50:
+            st.error("Not enough history.")
             st.stop()
-        hist["ret"] = np.log(hist["Close"] / hist["Close"].shift(1))
-        hv = hist["ret"].std() * np.sqrt(252)
+        rets = np.log(hist.Close / hist.Close.shift(1))
+        hv = rets.std() * np.sqrt(252)
 
-        st.write(f"**Current Price:** ${S:.2f} | **HV:** {hv*100:.1f}% | **r:** {r*100:.2f}% | **q:** {q*100:.2f}%")
+        st.write(f"**Spot:** ${S:.2f} | **HV:** {hv*100:.1f}% | **r:** {r*100:.2f}%")
 
-        expirations = ticker.options
+        expirations = [e for e in ticker.options if (datetime.strptime(e, "%Y-%m-%d") - datetime.now()).days <= max_dte]
         results = []
 
         for exp in expirations:
-            exp_dt = datetime.strptime(exp, "%Y-%m-%d")
-            dte = (exp_dt - datetime.now()).days
-            if dte > max_dte or dte <= 0:
-                continue
+            dte = (datetime.strptime(exp, "%Y-%m-%d") - datetime.now()).days
             T = dte / 365.25
-
             chain = ticker.option_chain(exp)
             calls = chain.calls[(chain.calls.bid > 0.01) & (chain.calls.impliedVolatility > 0.01)]
             puts = chain.puts[(chain.puts.bid > 0.01) & (chain.puts.impliedVolatility > 0.01)]
-            if calls.empty or puts.empty:
-                continue
+            if calls.empty or puts.empty: continue
 
-            # ATM IV for POP (market's vol forecast)
-            strikes = sorted(set(calls.strike) | set(puts.strike))
-            atm_strike = min(strikes, key=lambda x: abs(x - S))
-            atm_row = calls[calls.strike == atm_strike] if atm_strike in calls.strike.values else puts[puts.strike == atm_strike]
-            if atm_row.empty:
-                atm_row = calls.iloc[[np.argmin(np.abs(calls.strike - S))]]
-            sigma = atm_row.iloc[0].impliedVolatility  # ATM IV
+            iv = get_atm_iv(calls, puts, S)
 
-            for _, put_row in puts.iterrows():
-                Kp = put_row.strike
-                put_bid = put_row.bid
-                for _, call_row in calls.iterrows():
-                    Kc = call_row.strike
-                    call_bid = call_row.bid
-                    if Kc <= Kp:
-                        continue
+            # ----- Strategy Builders -----
+            def add_trade(trade):
+                if trade["Credit"] < min_credit: return
+                if trade["POP"] < target_pop/100: return
+                if trade.get("RR", 1) < rr_min: return
+                results.append(trade)
 
-                    # Force straddle if selected
-                    if strategy == "Short Straddle (same strike only)" and abs(Kp - Kc) > 0.01:
-                        continue
+            # 1. Short Strangle
+            if strategy in ["Short Strangle", "Short Straddle"]:
+                short_call = calls.iloc[np.argmin(np.abs(calls.impliedVolatility * calls.bid - delta_target * S))]  # approx delta
+                short_put = puts.iloc[np.argmin(np.abs(puts.impliedVolatility * puts.bid - delta_target * S))]
+                Kc, Kp = short_call.strike, short_put.strike
+                if strategy == "Short Straddle": Kp = Kc = round(S/5)*5
+                credit = short_call.bid + short_put.bid
+                max_loss = float('inf')
+                pop = norm.cdf((Kp - credit - S)/ (S * iv * np.sqrt(T))) + norm.cdf(-(Kc + credit - S)/ (S * iv * np.sqrt(T)))
+                add_trade({
+                    "Exp": exp, "DTE": dte, "Strategy": strategy,
+                    "Strikes": f"{Kp}P/{Kc}C", "Credit": round(credit,2),
+                    "POP": round(pop*100,1), "RR": 0,
+                    "Valuation": "—"
+                })
 
-                    credit = put_bid + call_bid
-                    if credit < 0.10:  # minimum worthwhile
-                        continue
+            # 2. Iron Condor
+            if strategy == "Iron Condor":
+                # Short wings ~0.16Δ, long wings ~0.05Δ
+                short_put = puts.iloc[np.argmin(np.abs([abs(option_delta(S, k, T, r, iv, q, "put")) - delta_target for k in puts.strike]))]
+                short_call = calls.iloc[np.argmin(np.abs([abs(option_delta(S, k, T, r, iv, q, "call")) - delta_target for k in calls.strike]))]
+                long_put = puts[puts.strike < short_put.strike].iloc[-1] if not puts[puts.strike < short_put.strike].empty else short_put
+                long_call = calls[calls.strike > short_call.strike].iloc[0] if not calls[calls.strike > short_call.strike].empty else short_call
 
-                    BE_low = Kp - credit
-                    BE_high = Kc + credit
-                    if BE_low >= BE_high:
-                        continue
+                credit = short_put.bid + short_call.bid - long_put.ask - long_call.ask
+                width = min(short_put.strike - long_put.strike, short_call.strike - long_call.strike)
+                max_loss = width - credit
+                rr = credit / max_loss if max_loss > 0 else 0
+                pop = 0.85  # approximate
+                theo = bs_put(S, short_put.strike, T, r, hv, q) + bs_call(S, short_call.strike, T, r, hv, q)
+                ratio = credit / theo if theo > 0 else 99
+                val = "Expensive" if ratio>1.2 else "Rich" if ratio>1.0 else "Fair"
+                add_trade({
+                    "Exp": exp, "DTE": dte, "Strategy": "Iron Condor",
+                    "Strikes": f"{long_put.strike}P/{short_put.strike}P - {short_call.strike}C/{long_call.strike}C",
+                    "Credit": round(credit,2), "MaxLoss": round(max_loss,2), "RR": round(rr,2),
+                    "POP": round(pop*100,1), "PremRatio": round(ratio,2), "Valuation": val
+                })
 
-                    # POP using ATM IV
-                    d2_low = calc_d2(S, BE_low, T, r, sigma, q)
-                    d2_high = calc_d2(S, BE_high, T, r, sigma, q)
-                    pop = norm.cdf(d2_low) - norm.cdf(d2_high)
+            # 3. Bull Put / Bear Call Spreads
+            if strategy in ["Bull Put Spread", "Bear Call Spread"]:
+                is_bull = strategy == "Bull Put Spread"
+                short_leg = puts if is_bull else calls
+                long_leg = puts if is_bull else calls
+                short_opt = short_leg.iloc[np.argmin(np.abs([abs(option_delta(S, k, T, r, iv, q, "put" if is_bull else "call")) - delta_target for k in short_leg.strike]))]
+                long_opt = long_leg[long_leg.strike < short_opt.strike].iloc[-1] if is_bull else long_leg[long_leg.strike > short_opt.strike].iloc[0]
+                if long_opt.empty: continue
+                credit = short_opt.bid - long_opt.ask
+                width = abs(short_opt.strike - long_opt.strike)
+                max_loss = width - credit
+                rr = credit / max_loss if max_loss > 0 else 0
+                add_trade({
+                    "Exp": exp, "DTE": dte, "Strategy": strategy,
+                    "Strikes": f"{long_opt.strike}/{short_opt.strike}",
+                    "Credit": round(credit,2), "MaxLoss": round(max_loss,2), "RR": round(rr,2),
+                    "POP": 88, "Valuation": "—"
+                })
 
-                    if pop < min_pop_pct / 100:
-                        continue
+            # 4. Jade Lizard (Short Put + Short Call ITM + Long Call OTM)
+            if strategy == "Jade Lizard":
+                short_put = puts.iloc[np.argmin(np.abs([abs(option_delta(S, k, T, r, iv, q, "put")) - 0.30 for k in puts.strike]))]
+                short_call_itm = calls[calls.strike < S].iloc[-1] if not calls[calls.strike < S].empty else calls.iloc[0]
+                long_call_otm = calls[calls.strike > S].iloc[0]
+                credit = short_put.bid + short_call_itm.bid - long_call_otm.ask
+                add_trade({
+                    "Exp": exp, "DTE": dte, "Strategy": "Jade Lizard",
+                    "Strikes": f"{short_put.strike}P + {short_call_itm.strike}C - {long_call_otm.strike}C",
+                    "Credit": round(credit,2), "POP": 80, "Valuation": "—"
+                })
 
-                    # Theoretical fair value using HV
-                    theo_call = bs_call(S, Kc, T, r, hv, q)
-                    theo_put = bs_put(S, Kp, T, r, hv, q)
-                    theo_credit = theo_call + theo_put
-                    premium_ratio = credit / theo_credit if theo_credit > 0 else np.inf
-
-                    expected_move_pct = sigma * np.sqrt(T) * 100
-
-                    results.append({
-                        "Expiration": exp,
-                        "DTE": dte,
-                        "Put Strike": Kp,
-                        "Call Strike": Kc,
-                        "Credit": round(credit, 2),
-                        "POP (%)": round(pop * 100, 1),
-                        "Prem Ratio": round(premium_ratio, 2),
-                        "Valuation": "Expensive (sell)" if premium_ratio > 1.2 else "Rich (sell)" if premium_ratio > 1.0 else "Fair" if 0.8 <= premium_ratio <= 1.0 else "Cheap (avoid selling)",
-                        "ATM IV (%)": round(sigma * 100, 1),
-                        "Exp Move (±%)": round(expected_move_pct, 1),
-                        "Breakevens": f"${BE_low:.2f} – ${BE_high:.2f}"
-                    })
-
+        # ------------------- Results -------------------
         if results:
             df = pd.DataFrame(results)
             df = df.sort_values("Credit", ascending=False)
-            st.success(f"Found {len(df)} setups ≥ {min_pop_pct}% POP!")
+            st.success(f"Found **{len(df)}** setups ≥ {target_pop}% POP")
             st.dataframe(df.head(20), use_container_width=True)
 
-            st.write("**Top pick:** Highest credit while meeting criteria.")
             top = df.iloc[0]
-            st.metric(f"Best Credit: ${top['Credit']} ({top['Put Strike']}P / {top['Call Strike']}C, exp {top['Expiration']})",
-                      f"POP {top['POP (%)']}% | {top['Valuation']} (ratio {top['Prem Ratio']})")
-
-            if top["Prem Ratio"] > 1.0:
+            st.metric(
+                label=f"**Best: {top['Strategy']}** – {top['Strikes']} (exp {top['Exp']})",
+                value=f"${top['Credit']} credit",
+                delta=f"POP {top['POP']}% | RR {top.get('RR','—')}"
+            )
+            if top.get("Valuation") and "Expensive" in top["Valuation"]:
                 st.balloons()
-                st.write("🎉 Options look **expensive**—great for selling!")
+
+            # Plot payoff
+            if "MaxLoss" in top:
+                fig = go.Figure()
+                x = np.linspace(S*0.7, S*1.3, 200)
+                payoff = np.where(x < top['Strikes'].split('/')[0], top['Credit'], 
+                                np.where(x > top['Strikes'].split('/')[-1], top['Credit'], 
+                                         top['Credit'] - abs(x - S)))
+                fig.add_trace(go.Scatter(x=x, y=payoff, mode='lines', name='Payoff'))
+                fig.add_vline(x=S, line_dash="dash", line_color="green")
+                fig.update_layout(title="Payoff at Expiration", xaxis_title="Stock Price", yaxis_title="P&L")
+                st.plotly_chart(fig(fig, use_container_width=True)
         else:
-            st.error("No setups found meeting criteria. Try lowering min POP, increasing max DTE, or high-IV stock (e.g., TSLA, NVDA during earnings). Short straddles rarely hit 95% POP.")
+            st.error("No setups found. Try lowering POP, increasing DTE, or using high-IV tickers (NVDA, TSLA).")
